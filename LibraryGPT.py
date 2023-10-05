@@ -17,8 +17,6 @@ pdf_directory = os.path.join("PDFs")
 db_path = os.path.join("library.db")
 
 def create_database():
-    # Define the path for database
-    db_path = os.path.join(os.path.expanduser('~'), 'Desktop', 'LibraryGPT', 'library.db')
                                                                                                                                                                                                                                                                                     
     # Create a new database or open connection if exists
     conn = sqlite3.connect(db_path)
@@ -52,7 +50,11 @@ def populate_database(pdf_directory, db_path):
     for filename in os.listdir(pdf_directory):
         if filename.endswith('.pdf'):
             pdf_path = os.path.join(pdf_directory, filename)
-            pdf = fitz.open(pdf_path)
+            try:
+                pdf = fitz.open(pdf_path)
+            except Exception as e:
+                print(f'Failed to open file {pdf_path}.')
+                continue
             
             for page_number in range(len(pdf)):
                 page = pdf.load_page(page_number)
@@ -132,7 +134,8 @@ st.sidebar.header("System Information")
 system_message = st.sidebar.text_input("Enter information for the system message:", "Please give a scientific answer.")
 
 if st.sidebar.button(label="Reset database"):
-    os.remove(db_path)
+    if os.path.exists(db_path):
+        os.remove(db_path)
     create_database()
     st.write(f'New database created in {db_path}.')
 
