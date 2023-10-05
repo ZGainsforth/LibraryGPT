@@ -4,3 +4,5 @@ scikit-learn
 sqlite3
 openai
 PyMuPDF
+transformers
+torch

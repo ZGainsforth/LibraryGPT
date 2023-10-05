@@ -5,6 +5,8 @@ import os
 import sqlite3
 import fitz  # PyMuPDF
 import openai
+from transformers import AutoTokenizer, AutoModel
+import torch
 from dotenv import load_dotenv
 load_dotenv()
 # You will need a line like the following in a .env file to access the OpenAI servers.  load_dotenv() will load the value.
@@ -39,9 +41,28 @@ def create_database():
     # Return the path of the database to verify its creation
     db_path
 
-def get_embedding(text, model="text-embedding-ada-002"):
-   text = text.replace("\n", " ")
-   return openai.Embedding.create(input = [text], model=model)['data'][0]['embedding']
+def get_embedding(text, model="bert-base-uncased"):
+    match model:
+        case 'bert-base-uncased' | 'squeezebert-uncased':
+            # Initialize BERT if it hasn't been initialized
+            if 'tokenizer' not in st.session_state:
+                st.session_state.tokenizer = AutoTokenizer.from_pretrained(model)
+            if 'model' not in st.session_state:
+                st.session_state.model = AutoModel.from_pretrained(model)
+                # Check if a GPU is available and if not, fall back to CPU
+                device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+                # Move the model to the device
+                st.session_state.model.to(device)
+            text = text.replace("\n", " ")
+            tokens = st.session_state.tokenizer(text, padding=True, truncation=True, return_tensors="pt")
+            with torch.no_grad():
+                output = st.session_state.model(**tokens)
+            # Use the mean of the last hidden state as the sentence embedding
+            embedding = output.last_hidden_state.mean(dim=1)
+            return embedding.cpu().numpy()
+        case 'text-embedding-ada-002':
+            text = text.replace("\n", " ")
+            return openai.Embedding.create(input = [text], model=model)['data'][0]['embedding']
 
 def populate_database(pdf_directory, db_path):
     conn = sqlite3.connect(db_path)
@@ -56,6 +77,7 @@ def populate_database(pdf_directory, db_path):
                 print(f'Failed to open file {pdf_path}.')
                 continue
             
+            st.write(f'Adding {filename}.')
             for page_number in range(len(pdf)):
                 page = pdf.load_page(page_number)
                 text_content = page.get_text()
@@ -70,7 +92,6 @@ def populate_database(pdf_directory, db_path):
                 insert_query = """INSERT INTO library (file_name, page_number, text_content, embedding)
                                   VALUES (?, ?, ?, ?);"""
                 cursor.execute(insert_query, (filename, page_number, text_content, embedding_blob))
-            st.write(f'Added {filename}.')
                 
     conn.commit()
     conn.close()
@@ -133,16 +154,17 @@ def query_gpt(system_message, context, question, model='gpt-3.5-turbo-16k'):
 st.sidebar.header("System Information")
 system_message = st.sidebar.text_input("Enter information for the system message:", "Please give a scientific answer.")
 
-if st.sidebar.button(label="Reset database"):
+if st.sidebar.button(label="Populate database"):
     if os.path.exists(db_path):
         os.remove(db_path)
     create_database()
     st.write(f'New database created in {db_path}.')
-
-if st.sidebar.button(label="Populate database"):
     st.spinner("Populating database...")
     populate_database(pdf_directory, db_path)
     st.write('Done')
+
+embedding_algorithm = st.sidebar.selectbox('Choose an embedding algorithm:', ('squeezebert-uncased', 'bert-base-uncased', 'text-embedding-ada-002'))
+# if 'bert' in embedding_algorithm.lower():
 
 model = st.sidebar.selectbox('Choose a model:', ('gpt-3.5-turbo-16k', 'gpt-4'))
 
