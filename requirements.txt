@@ -1,0 +1,6 @@
+streamlit
+numpy
+scikit-learn
+sqlite3
+openai
+PyMuPDF
