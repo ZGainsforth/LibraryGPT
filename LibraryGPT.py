@@ -6,7 +6,9 @@ import sqlite3
 import fitz  # PyMuPDF
 import openai
 from transformers import AutoTokenizer, AutoModel
+from transformers import GPT2Model, GPT2Tokenizer
 import torch
+import zlib
 from dotenv import load_dotenv
 load_dotenv()
 # You will need a line like the following in a .env file to access the OpenAI servers.  load_dotenv() will load the value.
@@ -41,18 +43,39 @@ def create_database():
     # Return the path of the database to verify its creation
     db_path
 
-def get_embedding(text, model="bert-base-uncased"):
-    match model:
-        case 'bert-base-uncased' | 'squeezebert-uncased':
-            # Initialize BERT if it hasn't been initialized
+def get_embedding(text):
+    match st.session_state.embedding_model_name:
+        case 'gpt2':
+            # Initialize the GPT-2 tokenizer and model
             if 'tokenizer' not in st.session_state:
-                st.session_state.tokenizer = AutoTokenizer.from_pretrained(model)
-            if 'model' not in st.session_state:
-                st.session_state.model = AutoModel.from_pretrained(model)
+                st.session_state.tokenizer = GPT2Tokenizer.from_pretrained(st.session_state.embedding_model_name)
+                st.session_state.tokenizer.pad_token = st.session_state.tokenizer.eos_token
+            if 'embedding_model' not in st.session_state:
+                st.session_state.embedding_model = GPT2Model.from_pretrained(st.session_state.embedding_model_name)
                 # Check if a GPU is available and if not, fall back to CPU
                 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
                 # Move the model to the device
-                st.session_state.model.to(device)
+                st.session_state.embedding_model.to(device)
+            # Tokenize the input text
+            inputs = st.session_state.tokenizer(text, return_tensors="pt", padding=True, truncation=True)
+            # Get the model's output
+            with torch.no_grad():
+                outputs = st.session_state.embedding_model(**inputs)
+            # Use the last hidden state as the embedding (you can also use other layers)
+            # The output shape is (batch_size, sequence_length, hidden_size)
+            # We take the mean over the sequence dimension to get a single embedding vector
+            embedding = outputs.last_hidden_state.mean(dim=1).squeeze().cpu().numpy()
+            return embedding
+        case 'bert-base-uncased' | 'squeezebert-uncased':
+            # Initialize BERT if it hasn't been initialized
+            if 'tokenizer' not in st.session_state:
+                st.session_state.tokenizer = AutoTokenizer.from_pretrained(st.session_state.embedding_model_name)
+            if 'embedding_model' not in st.session_state:
+                st.session_state.embedding_model = AutoModel.from_pretrained(st.session_state.embedding_model_name)
+                # Check if a GPU is available and if not, fall back to CPU
+                device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+                # Move the model to the device
+                st.session_state.embedding_model.to(device)
             text = text.replace("\n", " ")
             tokens = st.session_state.tokenizer(text, padding=True, truncation=True, return_tensors="pt")
             with torch.no_grad():
@@ -62,7 +85,7 @@ def get_embedding(text, model="bert-base-uncased"):
             return embedding.cpu().numpy()
         case 'text-embedding-ada-002':
             text = text.replace("\n", " ")
-            return openai.Embedding.create(input = [text], model=model)['data'][0]['embedding']
+            return openai.Embedding.create(input = [text], model=st.session_state.embedding_model_name)['data'][0]['embedding']
 
 def populate_database(pdf_directory, db_path):
     conn = sqlite3.connect(db_path)
@@ -91,8 +114,7 @@ def populate_database(pdf_directory, db_path):
                 # Insert into SQLite database
                 insert_query = """INSERT INTO library (file_name, page_number, text_content, embedding)
                                   VALUES (?, ?, ?, ?);"""
-                cursor.execute(insert_query, (filename, page_number, text_content, embedding_blob))
-                
+                cursor.execute(insert_query, (filename, page_number, zlib.compress(text_content.encode('utf-8')), embedding_blob))
     conn.commit()
     conn.close()
 
@@ -118,7 +140,8 @@ def get_context(question):
     top_indices = np.argsort(similarities[0])[-3:][::-1]
     
     # Fetch the corresponding file name, page number and text.
-    closest_contexts = [(rows[i][0], rows[i][1], rows[i][2]) for i in top_indices]
+    closest_contexts = [(rows[i][0], rows[i][1], zlib.decompress(rows[i][2])) for i in top_indices]
+    st.write(closest_contexts)
     
     conn.close()
     
@@ -163,7 +186,9 @@ if st.sidebar.button(label="Populate database"):
     populate_database(pdf_directory, db_path)
     st.write('Done')
 
-embedding_algorithm = st.sidebar.selectbox('Choose an embedding algorithm:', ('squeezebert-uncased', 'bert-base-uncased', 'text-embedding-ada-002'))
+st.session_state.embedding_model_name = 'gpt2'
+st.sidebar.write(f'Embedding model: {st.session_state.embedding_model_name}.')
+# embedding_algorithm = st.sidebar.selectbox('Choose an embedding algorithm:', ('squeezebert-uncased', 'bert-base-uncased', 'text-embedding-ada-002'))
 # if 'bert' in embedding_algorithm.lower():
 
 model = st.sidebar.selectbox('Choose a model:', ('gpt-3.5-turbo-16k', 'gpt-4'))
@@ -186,4 +211,6 @@ if user_question:
     # Display context for the user (they can look a the papers).
     st.write(f'The following papers are used as context on this search:')
     for c in context:
-        st.write(f'{c[0]}, page {c[1]}')
+        # st.write(f'{c[0]}, page {c[1]}')
+        pdf_link = f'<a href="file://{os.path.abspath(os.path.join("PDFs",c[0]))}" target="_blank">{c[0]}, page {c[1]}</a>'
+        st.markdown(pdf_link, unsafe_allow_html=True)
