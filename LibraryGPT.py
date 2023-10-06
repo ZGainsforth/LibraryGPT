@@ -20,14 +20,15 @@ load_dotenv()
 pdf_directory = os.path.join("PDFs")
 db_path = os.path.join("library.db")
 
+# We want to know how many tokens have been embedded.  It helps estimate charges.
+if 'embedding_token_count' not in st.session_state:
+    st.session_state.embedding_token_count = 0
+
 def create_database():
-                                                                                                                                                                                                                                                                                    
     # Create a new database or open connection if exists
     conn = sqlite3.connect(db_path)
-                                                                                                                                                                                                                                                                                    
     # Create a cursor                                                                                                                                                                                                                                               
     cursor = conn.cursor()
-                                                                                                                                                                                                                                                                                    
     # Define the table with columns: file_name, page_number, chunk_number, text_content, and embedding
     create_table_query = """CREATE TABLE IF NOT EXISTS library (
     file_name TEXT,
@@ -35,15 +36,15 @@ def create_database():
     text_content TEXT,
     embedding BLOB);
     """
-                                                                                                                                                                                                                                                                                    
     cursor.execute(create_table_query)
     conn.commit()
     conn.close()
-
     # Return the path of the database to verify its creation
     db_path
 
 def get_embedding(text):
+    if len(text) == 0:
+        return None
     match st.session_state.embedding_model_name:
         case 'gpt2':
             # Initialize the GPT-2 tokenizer and model
@@ -58,9 +59,14 @@ def get_embedding(text):
                 st.session_state.embedding_model.to(device)
             # Tokenize the input text
             inputs = st.session_state.tokenizer(text, return_tensors="pt", padding=True, truncation=True)
+            st.session_state.embedding_token_count += inputs.data['input_ids'].shape[-1]
             # Get the model's output
             with torch.no_grad():
-                outputs = st.session_state.embedding_model(**inputs)
+                try:
+                    outputs = st.session_state.embedding_model(**inputs)
+                except Exception as e:
+                    st.write(f'Error in embedding!  Exception is {e}')
+                    return np.zeros(768)
             # Use the last hidden state as the embedding (you can also use other layers)
             # The output shape is (batch_size, sequence_length, hidden_size)
             # We take the mean over the sequence dimension to get a single embedding vector
@@ -85,36 +91,54 @@ def get_embedding(text):
             return embedding.cpu().numpy()
         case 'text-embedding-ada-002':
             text = text.replace("\n", " ")
-            return openai.Embedding.create(input = [text], model=st.session_state.embedding_model_name)['data'][0]['embedding']
+            embedding = openai.Embedding.create(input = [text], model=st.session_state.embedding_model_name)
+            st.session_state.embedding_token_count += embedding['usage']['total_tokens']
+            return embedding['data'][0]['embedding']
+
+def add_to_database(cursor, filename, page_number, text_content):
+    # Generate embeddings using OpenAI API
+    # Note: You'll need to implement this part based on OpenAI's API documentation
+    embedding = get_embedding(text_content)
+    # Convert it to bytes for storage as a blob.
+    embedding_blob = np.array(embedding, dtype='float32').tobytes()
+    # Insert into SQLite database
+    insert_query = """INSERT INTO library (file_name, page_number, text_content, embedding)
+                    VALUES (?, ?, ?, ?);"""
+    cursor.execute(insert_query, (filename, page_number, zlib.compress(text_content.encode('utf-8')), embedding_blob))
+
+def process_pdf(pdf_path, cursor, conn):
+    filename = os.path.basename(pdf_path)
+    try:
+        pdf = fitz.open(pdf_path)
+    except Exception as e:
+        print(f'Failed to open file {pdf_path}.')
+        return
+    
+    # Check if this PDF is already in the database
+    check_query = """SELECT COUNT(*) FROM library WHERE file_name = ?;"""
+    cursor.execute(check_query, (filename,))
+    count = cursor.fetchone()[0]
+    if count == len(pdf):
+        st.write(f'Skipping {filename}, already in database.')
+        return
+    
+    st.write(f'Tokens={st.session_state.embedding_token_count}')
+    st.write(f'Adding {filename}.')
+
+    for page_number in range(len(pdf)):
+        page = pdf.load_page(page_number)
+        text_content = page.get_text()
+        if len(text_content) > 0:
+            add_to_database(cursor, filename, page_number, text_content)
+    conn.commit()
 
 def populate_database(pdf_directory, db_path):
     conn = sqlite3.connect(db_path)
     cursor = conn.cursor()
-    
     for filename in os.listdir(pdf_directory):
         if filename.endswith('.pdf'):
             pdf_path = os.path.join(pdf_directory, filename)
-            try:
-                pdf = fitz.open(pdf_path)
-            except Exception as e:
-                print(f'Failed to open file {pdf_path}.')
-                continue
-            
-            st.write(f'Adding {filename}.')
-            for page_number in range(len(pdf)):
-                page = pdf.load_page(page_number)
-                text_content = page.get_text()
-                
-                # Generate embeddings using OpenAI API
-                # Note: You'll need to implement this part based on OpenAI's API documentation
-                embedding = get_embedding(text_content)
-                # Convert it to bytes for storage as a blob.
-                embedding_blob = np.array(embedding, dtype='float32').tobytes()
-                
-                # Insert into SQLite database
-                insert_query = """INSERT INTO library (file_name, page_number, text_content, embedding)
-                                  VALUES (?, ?, ?, ?);"""
-                cursor.execute(insert_query, (filename, page_number, zlib.compress(text_content.encode('utf-8')), embedding_blob))
+            process_pdf(pdf_path, cursor, conn)
     conn.commit()
     conn.close()
 
@@ -178,18 +202,18 @@ st.sidebar.header("System Information")
 system_message = st.sidebar.text_input("Enter information for the system message:", "Please give a scientific answer.")
 
 if st.sidebar.button(label="Populate database"):
-    if os.path.exists(db_path):
-        os.remove(db_path)
-    create_database()
-    st.write(f'New database created in {db_path}.')
+    if not os.path.exists(db_path):
+        create_database()
+        st.write(f'New database created in {db_path}.')
     st.spinner("Populating database...")
     populate_database(pdf_directory, db_path)
     st.write('Done')
 
-st.session_state.embedding_model_name = 'gpt2'
+st.session_state.embedding_model_name = 'text-embedding-ada-002'
 st.sidebar.write(f'Embedding model: {st.session_state.embedding_model_name}.')
 # embedding_algorithm = st.sidebar.selectbox('Choose an embedding algorithm:', ('squeezebert-uncased', 'bert-base-uncased', 'text-embedding-ada-002'))
 # if 'bert' in embedding_algorithm.lower():
+st.sidebar.write(f'Total tokens embedded: {st.session_state.embedding_token_count}')
 
 model = st.sidebar.selectbox('Choose a model:', ('gpt-3.5-turbo-16k', 'gpt-4'))
 
