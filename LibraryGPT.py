@@ -165,7 +165,6 @@ def get_context(question):
     
     # Fetch the corresponding file name, page number and text.
     closest_contexts = [(rows[i][0], rows[i][1], zlib.decompress(rows[i][2])) for i in top_indices]
-    st.write(closest_contexts)
     
     conn.close()
     
@@ -190,12 +189,12 @@ def query_gpt(system_message, context, question, model='gpt-3.5-turbo-16k'):
         model=model,
         messages=conversation,
         temperature=0.2, # For this a lower temp is good because we want to stay faithful to the pdf context.
-        max_tokens=2000  # Limit the response length
+        max_tokens=1000  # Limit the response length
     )
     
     # Extract and return the assistant's reply
     assistant_reply = response['choices'][0]['message']['content']
-    return assistant_reply
+    return assistant_reply, response.usage
 
 # Sidebar
 st.sidebar.header("System Information")
@@ -227,7 +226,7 @@ if user_question:
     context = get_context(user_question)
 
     # Go to ChatGPT now.
-    answer = query_gpt(system_message=system_message, context=context, question=user_question, model=model)
+    answer, usage = query_gpt(system_message=system_message, context=context, question=user_question, model=model)
     
     # Display answer
     st.write(f"Answer: {answer}")
@@ -238,3 +237,8 @@ if user_question:
         # st.write(f'{c[0]}, page {c[1]}')
         pdf_link = f'<a href="file://{os.path.abspath(os.path.join("PDFs",c[0]))}" target="_blank">{c[0]}, page {c[1]}</a>'
         st.markdown(pdf_link, unsafe_allow_html=True)
+
+    st.write('Token usage information:')
+    st.write(usage)
+    st.write('Full Context information')
+    st.write(context)
