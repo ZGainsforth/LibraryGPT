@@ -5,14 +5,15 @@ import os
 import sqlite3
 import fitz  # PyMuPDF
 import openai
+from openai import OpenAI
+# You will need a line like the following in a .env file to access the OpenAI servers.  the openai module will load the value.
+#OPENAI_API_KEY=<your key here>
 from transformers import AutoTokenizer, AutoModel
 from transformers import GPT2Model, GPT2Tokenizer
 import torch
 import zlib
-from dotenv import load_dotenv
-load_dotenv()
-# You will need a line like the following in a .env file to access the OpenAI servers.  load_dotenv() will load the value.
-#OPENAI_API_KEY=<your key here>
+
+client = OpenAI()
 
 # You will need to populate the PDFs directory with the PDFs.
 
@@ -91,9 +92,11 @@ def get_embedding(text):
             return embedding.cpu().numpy()
         case 'text-embedding-ada-002':
             text = text.replace("\n", " ")
-            embedding = openai.Embedding.create(input = [text], model=st.session_state.embedding_model_name)
-            st.session_state.embedding_token_count += embedding['usage']['total_tokens']
-            return embedding['data'][0]['embedding']
+            breakpoint()
+            embedding = client.embeddings.create(input=[text], model=st.session_state.embedding_model_name)
+            # embedding = openai.Embedding.create(input = [text], engine=st.session_state.embedding_model_name)
+            st.session_state.embedding_token_count += embedding.usage.total_tokens
+            return embedding.data[0].embedding
 
 def add_to_database(cursor, filename, page_number, text_content):
     # Generate embeddings using OpenAI API
@@ -173,7 +176,7 @@ def get_context(question):
 # Streamlit App
 st.title("Library GPT")
 
-def query_gpt(system_message, context, question, model='gpt-3.5-turbo-16k'):
+def query_gpt(system_message, context, question, model='gpt-4.1-nano'):
     # Combine system message and user question
     conversation = [
         {"role": "system", "content": system_message},
@@ -214,7 +217,7 @@ st.sidebar.write(f'Embedding model: {st.session_state.embedding_model_name}.')
 # if 'bert' in embedding_algorithm.lower():
 st.sidebar.write(f'Total tokens embedded: {st.session_state.embedding_token_count}')
 
-model = st.sidebar.selectbox('Choose a model:', ('gpt-3.5-turbo-16k', 'gpt-4'))
+model = st.sidebar.selectbox('Choose a model:', ('gpt-4.1-mini', 'gpt-4.1-nano'))
 
 # Main
 st.header(f"Welcome, how can I assist you today?")

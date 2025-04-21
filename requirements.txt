@@ -1,8 +1,9 @@
 streamlit
 numpy
 scikit-learn
-sqlite3
+sqlite
 openai
 PyMuPDF
 transformers
 torch
+dotenv
