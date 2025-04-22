@@ -4,7 +4,9 @@ from sklearn.metrics.pairwise import cosine_similarity
 import os
 import sqlite3
 import fitz  # PyMuPDF
-import openai
+from openai import OpenAI
+
+client = OpenAI()
 from openai import OpenAI
 # You will need a line like the following in a .env file to access the OpenAI servers.  the openai module will load the value.
 #OPENAI_API_KEY=<your key here>
@@ -92,7 +94,6 @@ def get_embedding(text):
             return embedding.cpu().numpy()
         case 'text-embedding-ada-002':
             text = text.replace("\n", " ")
-            breakpoint()
             embedding = client.embeddings.create(input=[text], model=st.session_state.embedding_model_name)
             # embedding = openai.Embedding.create(input = [text], engine=st.session_state.embedding_model_name)
             st.session_state.embedding_token_count += embedding.usage.total_tokens
@@ -116,7 +117,7 @@ def process_pdf(pdf_path, cursor, conn):
     except Exception as e:
         print(f'Failed to open file {pdf_path}.')
         return
-    
+
     # Check if this PDF is already in the database
     check_query = """SELECT COUNT(*) FROM library WHERE file_name = ?;"""
     cursor.execute(check_query, (filename,))
@@ -124,7 +125,7 @@ def process_pdf(pdf_path, cursor, conn):
     if count == len(pdf):
         st.write(f'Skipping {filename}, already in database.')
         return
-    
+
     st.write(f'Tokens={st.session_state.embedding_token_count}')
     st.write(f'Adding {filename}.')
 
@@ -149,28 +150,28 @@ def get_context(question):
     # Generate the embedding for the question using OpenAI API (placeholder)
     question_embedding = get_embedding(question)
     question_embedding = np.array(question_embedding).reshape(1, -1)  # Reshape for cosine_similarity
-    
+
     # Connect to SQLite database
     conn = sqlite3.connect(db_path)
     cursor = conn.cursor()
-    
+
     # Fetch all embeddings from the database
     cursor.execute("SELECT file_name, page_number, text_content, embedding FROM library")
     rows = cursor.fetchall()
-    
+
     # Calculate cosine similarity
     db_embeddings = [np.frombuffer(row[3], dtype='float32') for row in rows]
     db_embeddings = np.vstack(db_embeddings)
     similarities = cosine_similarity(question_embedding, db_embeddings)
-    
+
     # Get the indices of the three most similar embeddings
     top_indices = np.argsort(similarities[0])[-3:][::-1]
-    
+
     # Fetch the corresponding file name, page number and text.
     closest_contexts = [(rows[i][0], rows[i][1], zlib.decompress(rows[i][2])) for i in top_indices]
-    
+
     conn.close()
-    
+
     return closest_contexts
 
 # Streamlit App
@@ -188,15 +189,14 @@ def query_gpt(system_message, context, question, model='gpt-4.1-nano'):
     conversation.append({"role": "user", "content": question})
 
     # Make API call
-    response = openai.ChatCompletion.create(
-        model=model,
+    response = client.chat.completions.create(model=model,
         messages=conversation,
         temperature=0.2, # For this a lower temp is good because we want to stay faithful to the pdf context.
         max_tokens=1000  # Limit the response length
-    )
-    
+        )
+
     # Extract and return the assistant's reply
-    assistant_reply = response['choices'][0]['message']['content']
+    assistant_reply = response.choices[0].message.content
     return assistant_reply, response.usage
 
 # Sidebar
@@ -230,7 +230,7 @@ if user_question:
 
     # Go to ChatGPT now.
     answer, usage = query_gpt(system_message=system_message, context=context, question=user_question, model=model)
-    
+
     # Display answer
     st.write(f"Answer: {answer}")
 
