@@ -20,8 +20,10 @@ client = OpenAI()
 # You will need to populate the PDFs directory with the PDFs.
 
 # Define the paths for the database and pdfs.
-pdf_directory = os.path.join("PDFs")
 db_path = os.path.join("library.db")
+if 'pdf_directory' not in st.session_state:
+    st.session_state.pdf_directory = os.path.join("PDFs")
+
 
 # We want to know how many tokens have been embedded.  It helps estimate charges.
 if 'embedding_token_count' not in st.session_state:
@@ -134,14 +136,16 @@ def process_pdf(pdf_path, cursor, conn):
         text_content = page.get_text()
         if len(text_content) > 0:
             add_to_database(cursor, filename, page_number, text_content)
+        else:
+            st.write(f'Skipping {filename} page {page_number} as it has no text.')
     conn.commit()
 
-def populate_database(pdf_directory, db_path):
+def populate_database(db_path):
     conn = sqlite3.connect(db_path)
     cursor = conn.cursor()
-    for filename in os.listdir(pdf_directory):
+    for filename in os.listdir(st.session_state.pdf_directory):
         if filename.endswith('.pdf'):
-            pdf_path = os.path.join(pdf_directory, filename)
+            pdf_path = os.path.join(st.session_state.pdf_directory, filename)
             process_pdf(pdf_path, cursor, conn)
     conn.commit()
     conn.close()
@@ -200,6 +204,9 @@ def query_gpt(system_message, context, question, model='gpt-4.1-nano'):
     return assistant_reply, response.usage
 
 # Sidebar
+st.sidebar.header("Configuration")
+st.session_state.pdf_directory = st.sidebar.text_input("PDF Directory:", value=st.session_state.pdf_directory)
+
 st.sidebar.header("System Information")
 system_message = st.sidebar.text_input("Enter information for the system message:", "Please give a scientific answer.")
 
@@ -208,7 +215,7 @@ if st.sidebar.button(label="Populate database"):
         create_database()
         st.write(f'New database created in {db_path}.')
     st.spinner("Populating database...")
-    populate_database(pdf_directory, db_path)
+    populate_database(db_path)
     st.write('Done')
 
 st.session_state.embedding_model_name = 'text-embedding-ada-002'
