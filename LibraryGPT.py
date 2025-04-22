@@ -2,12 +2,13 @@ import streamlit as st
 import numpy as np
 from sklearn.metrics.pairwise import cosine_similarity
 import os
+import time
 import sqlite3
 import fitz  # PyMuPDF
 from openai import OpenAI
 
 client = OpenAI()
-from openai import OpenAI
+from openai import OpenAI, OpenAIError
 # You will need a line like the following in a .env file to access the OpenAI servers.  the openai module will load the value.
 #OPENAI_API_KEY=<your key here>
 from transformers import AutoTokenizer, AutoModel
@@ -100,6 +101,11 @@ def get_embedding(text):
             # embedding = openai.Embedding.create(input = [text], engine=st.session_state.embedding_model_name)
             st.session_state.embedding_token_count += embedding.usage.total_tokens
             return embedding.data[0].embedding
+        case 'text-embedding-3-small':
+            text = text.replace("\n", " ")
+            embedding = client.embeddings.create(input=[text], model=st.session_state.embedding_model_name)
+            st.session_state.embedding_token_count += embedding.usage.total_tokens
+            return embedding.data[0].embedding
 
 def add_to_database(cursor, filename, page_number, text_content):
     # Generate embeddings using OpenAI API
@@ -112,6 +118,34 @@ def add_to_database(cursor, filename, page_number, text_content):
                     VALUES (?, ?, ?, ?);"""
     cursor.execute(insert_query, (filename, page_number, zlib.compress(text_content.encode('utf-8')), embedding_blob))
 
+def add_to_database_batch(cursor, filename, pages):
+    # Prepare batch of texts for embedding
+    texts = list(pages.values())
+    page_numbers = list(pages.keys())
+    
+    # Get batch embeddings
+    try:
+        embeddings = client.embeddings.create(input=texts, model=st.session_state.embedding_model_name)
+    except OpenAIError as e:
+        st.warning(f'Error embedding with exception {e}.  Truncating text for batch and trying again.')
+        texts = [text[:5000] for text in texts]
+        try:
+            embeddings = client.embeddings.create(input=texts, model=st.session_state.embedding_model_name)
+        except OpenAIError as e:
+            st.warning(f'Error embedding with exception {e}  Skipping this PDF.')
+            return
+
+    st.session_state.embedding_token_count += embeddings.usage.total_tokens
+
+    # Insert each page and its embedding into the database
+    for page_number, text_content, embedding in zip(page_numbers, texts, embeddings.data):
+        embedding_blob = np.array(embedding.embedding, dtype='float32').tobytes()
+        insert_query = """INSERT INTO library (file_name, page_number, text_content, embedding)
+                        VALUES (?, ?, ?, ?);"""
+        cursor.execute(insert_query, (filename, page_number, zlib.compress(text_content.encode('utf-8')), embedding_blob))
+
+    # st.write(f'Added {len(pages)} pages from {filename}.')
+
 def process_pdf(pdf_path, cursor, conn):
     filename = os.path.basename(pdf_path)
     try:
@@ -120,25 +154,48 @@ def process_pdf(pdf_path, cursor, conn):
         print(f'Failed to open file {pdf_path}.')
         return
 
+    # Collect all the pages in the pdf and extract text
+    pages ={} # Dictionary to store text content of each page
+    for page_number in range(len(pdf)):
+        page = pdf.load_page(page_number)
+        text_content = page.get_text() 
+        if len(text_content) > 0:
+            pages[page_number] = text_content
+        # else:
+        #     st.write(f'Skipping {filename} page {page_number} has no text.')
+
     # Check if this PDF is already in the database
     check_query = """SELECT COUNT(*) FROM library WHERE file_name = ?;"""
     cursor.execute(check_query, (filename,))
     count = cursor.fetchone()[0]
-    if count == len(pdf):
+    if count == len(pages):
         st.write(f'Skipping {filename}, already in database.')
         return
 
-    st.write(f'Tokens={st.session_state.embedding_token_count}')
     st.write(f'Adding {filename}.')
 
-    for page_number in range(len(pdf)):
-        page = pdf.load_page(page_number)
-        text_content = page.get_text()
-        if len(text_content) > 0:
-            add_to_database(cursor, filename, page_number, text_content)
-        else:
-            st.write(f'Skipping {filename} page {page_number} as it has no text.')
-    conn.commit()
+    add_to_database_batch(cursor, filename, pages)    
+
+    st.write(f'Tokens={st.session_state.embedding_token_count}')
+
+    # conn.commit()
+    # Simple retry mechanism with three attempts
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            conn.commit()
+            st.success(f"Successfully added {filename} to the database.")
+            return  # Exit the function if commit is successful
+        except sqlite3.OperationalError as e:
+            if attempt < max_retries - 1:  # If it's not the last attempt
+                st.warning(f"Commit failed for {filename}. Retrying in 1 second... (Attempt {attempt + 1}/{max_retries})")
+                time.sleep(1)  # Wait for 1 second before retrying
+            else:
+                st.error(f"Failed to commit changes for {filename} after {max_retries} attempts. Error: {e}")
+                raise  # Re-raise the exception if all retries failed
+
+    # This line will only be reached if all retries fail
+    st.error(f"Failed to add {filename} to the database after {max_retries} attempts.")
 
 def populate_database(db_path):
     conn = sqlite3.connect(db_path)
@@ -218,13 +275,14 @@ if st.sidebar.button(label="Populate database"):
     populate_database(db_path)
     st.write('Done')
 
-st.session_state.embedding_model_name = 'text-embedding-ada-002'
+# st.session_state.embedding_model_name = 'text-embedding-ada-002'
+st.session_state.embedding_model_name = 'text-embedding-3-small'
 st.sidebar.write(f'Embedding model: {st.session_state.embedding_model_name}.')
 # embedding_algorithm = st.sidebar.selectbox('Choose an embedding algorithm:', ('squeezebert-uncased', 'bert-base-uncased', 'text-embedding-ada-002'))
 # if 'bert' in embedding_algorithm.lower():
 st.sidebar.write(f'Total tokens embedded: {st.session_state.embedding_token_count}')
 
-model = st.sidebar.selectbox('Choose a model:', ('gpt-4.1-mini', 'gpt-4.1-nano'))
+model = st.sidebar.selectbox('Choose a model:', ('gpt-4.1-nano', 'gpt-4.1-mini'))
 
 # Main
 st.header(f"Welcome, how can I assist you today?")
