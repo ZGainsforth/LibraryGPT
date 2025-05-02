@@ -11,12 +11,15 @@ import zlib
 import shutil
 from chromadb.errors import InternalError
 import hashlib
+from dotenv import load_dotenv
+#Load the .env file which has the OpenAI API key
+load_dotenv()
 
 client = OpenAI()
 
 # Define the paths for the database and pdfs.
 if 'pdf_directory' not in st.session_state:
-    st.session_state.pdf_directory = os.path.join("PDFs")
+    st.session_state.pdf_directory = os.path.join("R:\PapersLibrary")
 
 # We want to know how many tokens have been embedded.  It helps estimate charges.
 if 'embedding_token_count' not in st.session_state:
@@ -224,19 +227,21 @@ if st.sidebar.button(label="Populate database"):
     st.spinner("Populating database...")
     populate_database(st.session_state.chroma_collection)
     st.write('Done')
-
+st.sidebar.write(f'Total tokens embedded: {st.session_state.embedding_token_count}')
 
 st.sidebar.header("System Information")
-system_message = st.sidebar.text_input("Enter information for the system message:", "Please give a scientific answer.")
+system_message = st.sidebar.text_input("Enter information for the system message:", "Please give a scientific answer and cite references.")
 
 st.sidebar.header("Query Settings")
 n_results = st.sidebar.slider("Number of context results", min_value=1, max_value=50, value=5, step=1)
 
 st.session_state.embedding_model_name = 'text-embedding-3-small'
 st.sidebar.write(f'Embedding model: {st.session_state.embedding_model_name}.')
-st.sidebar.write(f'Total tokens embedded: {st.session_state.embedding_token_count}')
 
-model = st.sidebar.selectbox('Choose a model:', ('gpt-4.1-nano', 'gpt-4.1-mini'))
+model = st.sidebar.selectbox('Choose a model:', ('gpt-4.1-mini', 'gpt-4.1-nano', 'gpt-4o-mini', 'gpt-4o', 'o1-mini'))
+# Query OpenAI and print the context windows size and price per megatoken for the selected model.
+
+
 
 # Main
 st.header(f"Welcome, how can I assist you today?")
@@ -256,7 +261,7 @@ if user_question:
     # Display context for the user (they can look a the papers).
     st.write(f'The following papers are used as context on this search:')
     for c in context:
-        pdf_link = f'<a href="file://{os.path.abspath(os.path.join("PDFs", c["filename"]))}" target="_blank">{c["filename"]}, page {c["page_number"]}, distance {c["distance"]:.4f}</a>'
+        pdf_link = f'<a href="file://{os.path.abspath(os.path.join(st.session_state.pdf_directory, c["filename"]))}" target="_blank">{c["filename"]}, page {c["page_number"]}, distance {c["distance"]:.4f}</a>'
         st.markdown(pdf_link, unsafe_allow_html=True)
 
     st.write('Token usage information:')
