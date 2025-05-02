@@ -10,6 +10,7 @@ from chromadb.config import Settings
 import zlib
 import shutil
 from chromadb.errors import InternalError
+import hashlib
 
 client = OpenAI()
 
@@ -21,17 +22,15 @@ if 'pdf_directory' not in st.session_state:
 if 'embedding_token_count' not in st.session_state:
     st.session_state.embedding_token_count = 0
 
-st.write(f"ChromaDB version: {chromadb.__version__}")
-
 def create_database():
-    # Create a new ChromaDB client
-    chroma_client = chromadb.PersistentClient(path="./chroma_db")
+    if 'chroma_client' not in st.session_state:
+        st.session_state.chroma_client = chromadb.PersistentClient(path="./chroma_db")
     
     # Create a new collection for our library
-    collection = chroma_client.get_or_create_collection(name="library")
+    if 'chroma_collection' not in st.session_state:
+        st.session_state.chroma_collection = st.session_state.chroma_client.get_or_create_collection(name="library")
     
-    return chroma_client, collection
-
+    return
 def get_embedding(text):
     if len(text) == 0:
         return None
@@ -53,10 +52,16 @@ def check_disk_space(path, required_space_mb=100):
     free_mb = free // (2**20)
     return free_mb > required_space_mb
 
-def add_to_database_batch(collection, filename, pages, max_retries=3, retry_delay=1):
+def add_to_database_batch(collection, filename, pages, pdf_hash, max_retries=3, retry_delay=10):
     # Prepare batch of texts for embedding
     texts = list(pages.values())
     page_numbers = list(pages.keys())
+    
+    # If texts is a list with a single empty string then skip this PDF
+    # This is a wierd error condition for chroma, it errors only if there is a list with one empty string.
+    if not texts or not texts[0]:
+        st.warning(f"Skipping {filename} because it contains no text.")
+        return
     
     # Get batch embeddings
     try:
@@ -67,14 +72,14 @@ def add_to_database_batch(collection, filename, pages, max_retries=3, retry_dela
         try:
             embeddings = client.embeddings.create(input=texts, model=st.session_state.embedding_model_name)
         except OpenAIError as e:
-            st.warning(f'Error embedding with exception {e}  Skipping this PDF.')
+            st.warning(f'Error embedding with exception {e}.  Skipping this PDF.')
             return
 
     st.session_state.embedding_token_count += embeddings.usage.total_tokens
 
     # Insert each page and its embedding into the database
     ids = [f"{filename}_{page_number}" for page_number in page_numbers]
-    metadatas = [{"filename": filename, "page_number": page_number} for page_number in page_numbers]
+    metadatas = [{"filename": filename, "page_number": page_number, "pdf_hash": pdf_hash} for page_number in page_numbers]
     embeddings_list = [embedding.embedding for embedding in embeddings.data]
 
     for attempt in range(max_retries):
@@ -92,7 +97,7 @@ def add_to_database_batch(collection, filename, pages, max_retries=3, retry_dela
             break
         except InternalError as e:
             if attempt < max_retries - 1:
-                st.warning(f"Database error occurred. Retrying in {retry_delay} seconds... (Attempt {attempt + 1}/{max_retries})")
+                st.warning(f"Database error occurred. Retrying in {retry_delay} seconds... (Attempt {attempt + 1}/{max_retries})\n{e}")
                 time.sleep(retry_delay)
             else:
                 st.error(f"Failed to add data to the database after {max_retries} attempts. Error: {e}")
@@ -100,10 +105,28 @@ def add_to_database_batch(collection, filename, pages, max_retries=3, retry_dela
 
 def process_pdf(pdf_path, collection):
     filename = os.path.basename(pdf_path)
+    
+    # Calculate hash of the PDF
+    with open(pdf_path, "rb") as f:
+        pdf_hash = hashlib.sha256(f.read()).hexdigest()
+
+    # Check if this PDF is already in the database
+    try:
+        existing_docs = collection.get(
+            where={"pdf_hash": pdf_hash},
+            include=["metadatas"]
+        )
+        if existing_docs['metadatas']:
+            st.write(f'Skipping {filename}, already in database.')
+            return
+    except InternalError as e:
+        st.warning(f"Error checking existing pages for {filename}. Error: {e}")
+        # Continue with adding the PDF, as we couldn't verify if it's already in the database
+
     try:
         pdf = fitz.open(pdf_path)
     except Exception as e:
-        print(f'Failed to open file {pdf_path}.')
+        st.error(f'Failed to open file {pdf_path}. Error: {e}')
         return
 
     # Collect all the pages in the pdf and extract text
@@ -114,22 +137,9 @@ def process_pdf(pdf_path, collection):
         if len(text_content) > 0:
             pages[page_number] = text_content
 
-    # Check if this PDF is already in the database
-    try:
-        existing_pages = collection.get(
-            where={"filename": filename},
-            include=["metadatas"]
-        )
-        if len(existing_pages['metadatas']) == len(pages):
-            st.write(f'Skipping {filename}, already in database.')
-            return
-    except InternalError as e:
-        st.warning(f"Error checking existing pages for {filename}. Error: {e}")
-        # Continue with adding the PDF, as we couldn't verify if it's already in the database
-
     st.write(f'Adding {filename}.')
 
-    add_to_database_batch(collection, filename, pages)    
+    add_to_database_batch(collection, filename, pages, pdf_hash)    
 
     st.write(f'Tokens={st.session_state.embedding_token_count}')
     st.success(f"Successfully added {filename} to the database.")
@@ -148,15 +158,9 @@ def get_context(question, collection):
         # Query the collection for similar contexts
         results = collection.query(
             query_embeddings=[question_embedding],
-            n_results=5,
+            n_results=n_results,
             include=['metadatas', 'documents', 'distances']
         )
-
-        # # Print debug information
-        # st.write("Debug information:")
-        # st.write(f"Results structure: {results.keys()}")
-        # for key, value in results.items():
-        #     st.write(f"{key}: {type(value)}, Length: {len(value) if value is not None else 'None'}")
 
         # Check if the results contain the expected keys and are not empty
         if not all(key in results and results[key] for key in ['ids', 'metadatas', 'documents', 'distances']):
@@ -169,15 +173,13 @@ def get_context(question, collection):
             metadata = results['metadatas'][0][i]
             document = results['documents'][0][i]
             distance = results['distances'][0][i]
-            closest_contexts.append((
-                metadata['filename'],
-                metadata['page_number'],
-                distance,
-                document
-            ))
-
-        # st.write(f"Number of results: {len(closest_contexts)}")
-        # st.write(f"Distances: {results['distances']}")
+            closest_contexts.append({
+                'filename': metadata['filename'],
+                'page_number': metadata['page_number'],
+                'distance': distance,
+                'content': document,
+                'pdf_hash': metadata['pdf_hash']
+            })
 
         return closest_contexts
 
@@ -197,7 +199,7 @@ def query_gpt(system_message, context, question, model='gpt-4.1-nano'):
         {"role": "system", "content": system_message},
     ]
     for c in context:
-        conversation.append({"role":"system", "content": f'Consider the following text: {c[2]}'})
+        conversation.append({"role":"system", "content": f'Consider the following text: {c["content"]}'})
     conversation.append({"role": "user", "content": question})
 
     # Make API call
@@ -212,24 +214,27 @@ def query_gpt(system_message, context, question, model='gpt-4.1-nano'):
     return assistant_reply, response.usage
 
 # Sidebar
-st.sidebar.header("Configuration")
+st.sidebar.header("Database Configuration")
+st.sidebar.write(f"ChromaDB version: {chromadb.__version__}")
 st.session_state.pdf_directory = st.sidebar.text_input("PDF Directory:", value=st.session_state.pdf_directory)
+if 'chroma_client' not in st.session_state or 'chroma_collection' not in st.session_state:
+    create_database()
+st.sidebar.write(f"Number of documents in collection: {st.session_state.chroma_collection.count()}")
+if st.sidebar.button(label="Populate database"):
+    st.spinner("Populating database...")
+    populate_database(st.session_state.chroma_collection)
+    st.write('Done')
+
 
 st.sidebar.header("System Information")
 system_message = st.sidebar.text_input("Enter information for the system message:", "Please give a scientific answer.")
 
-if 'chroma_client' not in st.session_state or 'collection' not in st.session_state:
-    st.session_state.chroma_client, st.session_state.collection = create_database()
-
-if st.sidebar.button(label="Populate database"):
-    st.spinner("Populating database...")
-    populate_database(st.session_state.collection)
-    st.write('Done')
+st.sidebar.header("Query Settings")
+n_results = st.sidebar.slider("Number of context results", min_value=1, max_value=50, value=5, step=1)
 
 st.session_state.embedding_model_name = 'text-embedding-3-small'
 st.sidebar.write(f'Embedding model: {st.session_state.embedding_model_name}.')
 st.sidebar.write(f'Total tokens embedded: {st.session_state.embedding_token_count}')
-st.write(f"Number of documents in collection: {st.session_state.collection.count()}")
 
 model = st.sidebar.selectbox('Choose a model:', ('gpt-4.1-nano', 'gpt-4.1-mini'))
 
@@ -240,7 +245,7 @@ st.header(f"Welcome, how can I assist you today?")
 user_question = st.text_area("Your Question:")
 if user_question:
     # Search the pdf library to get three pages of context for GPT to use to answer the question.
-    context = get_context(user_question, st.session_state.collection)
+    context = get_context(user_question, st.session_state.chroma_collection)
 
     # Go to ChatGPT now.
     answer, usage = query_gpt(system_message=system_message, context=context, question=user_question, model=model)
@@ -251,7 +256,7 @@ if user_question:
     # Display context for the user (they can look a the papers).
     st.write(f'The following papers are used as context on this search:')
     for c in context:
-        pdf_link = f'<a href="file://{os.path.abspath(os.path.join("PDFs",c[0]))}" target="_blank">{c[0]}, page {c[1]}, distance {c[2]}</a>'
+        pdf_link = f'<a href="file://{os.path.abspath(os.path.join("PDFs", c["filename"]))}" target="_blank">{c["filename"]}, page {c["page_number"]}, distance {c["distance"]:.4f}</a>'
         st.markdown(pdf_link, unsafe_allow_html=True)
 
     st.write('Token usage information:')
