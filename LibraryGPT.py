@@ -3,102 +3,42 @@ import numpy as np
 from sklearn.metrics.pairwise import cosine_similarity
 import os
 import time
-import sqlite3
 import fitz  # PyMuPDF
-from openai import OpenAI
-
-client = OpenAI()
 from openai import OpenAI, OpenAIError
-# You will need a line like the following in a .env file to access the OpenAI servers.  the openai module will load the value.
-#OPENAI_API_KEY=<your key here>
-from transformers import AutoTokenizer, AutoModel
-from transformers import GPT2Model, GPT2Tokenizer
-import torch
+import chromadb
+from chromadb.config import Settings
 import zlib
+import shutil
+from chromadb.errors import InternalError
 
 client = OpenAI()
-
-# You will need to populate the PDFs directory with the PDFs.
 
 # Define the paths for the database and pdfs.
-db_path = os.path.join("library.db")
 if 'pdf_directory' not in st.session_state:
     st.session_state.pdf_directory = os.path.join("PDFs")
-
 
 # We want to know how many tokens have been embedded.  It helps estimate charges.
 if 'embedding_token_count' not in st.session_state:
     st.session_state.embedding_token_count = 0
 
+st.write(f"ChromaDB version: {chromadb.__version__}")
+
 def create_database():
-    # Create a new database or open connection if exists
-    conn = sqlite3.connect(db_path)
-    # Create a cursor                                                                                                                                                                                                                                               
-    cursor = conn.cursor()
-    # Define the table with columns: file_name, page_number, chunk_number, text_content, and embedding
-    create_table_query = """CREATE TABLE IF NOT EXISTS library (
-    file_name TEXT,
-    page_number INTEGER,
-    text_content TEXT,
-    embedding BLOB);
-    """
-    cursor.execute(create_table_query)
-    conn.commit()
-    conn.close()
-    # Return the path of the database to verify its creation
-    db_path
+    # Create a new ChromaDB client
+    chroma_client = chromadb.PersistentClient(path="./chroma_db")
+    
+    # Create a new collection for our library
+    collection = chroma_client.get_or_create_collection(name="library")
+    
+    return chroma_client, collection
 
 def get_embedding(text):
     if len(text) == 0:
         return None
     match st.session_state.embedding_model_name:
-        case 'gpt2':
-            # Initialize the GPT-2 tokenizer and model
-            if 'tokenizer' not in st.session_state:
-                st.session_state.tokenizer = GPT2Tokenizer.from_pretrained(st.session_state.embedding_model_name)
-                st.session_state.tokenizer.pad_token = st.session_state.tokenizer.eos_token
-            if 'embedding_model' not in st.session_state:
-                st.session_state.embedding_model = GPT2Model.from_pretrained(st.session_state.embedding_model_name)
-                # Check if a GPU is available and if not, fall back to CPU
-                device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-                # Move the model to the device
-                st.session_state.embedding_model.to(device)
-            # Tokenize the input text
-            inputs = st.session_state.tokenizer(text, return_tensors="pt", padding=True, truncation=True)
-            st.session_state.embedding_token_count += inputs.data['input_ids'].shape[-1]
-            # Get the model's output
-            with torch.no_grad():
-                try:
-                    outputs = st.session_state.embedding_model(**inputs)
-                except Exception as e:
-                    st.write(f'Error in embedding!  Exception is {e}')
-                    return np.zeros(768)
-            # Use the last hidden state as the embedding (you can also use other layers)
-            # The output shape is (batch_size, sequence_length, hidden_size)
-            # We take the mean over the sequence dimension to get a single embedding vector
-            embedding = outputs.last_hidden_state.mean(dim=1).squeeze().cpu().numpy()
-            return embedding
-        case 'bert-base-uncased' | 'squeezebert-uncased':
-            # Initialize BERT if it hasn't been initialized
-            if 'tokenizer' not in st.session_state:
-                st.session_state.tokenizer = AutoTokenizer.from_pretrained(st.session_state.embedding_model_name)
-            if 'embedding_model' not in st.session_state:
-                st.session_state.embedding_model = AutoModel.from_pretrained(st.session_state.embedding_model_name)
-                # Check if a GPU is available and if not, fall back to CPU
-                device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-                # Move the model to the device
-                st.session_state.embedding_model.to(device)
-            text = text.replace("\n", " ")
-            tokens = st.session_state.tokenizer(text, padding=True, truncation=True, return_tensors="pt")
-            with torch.no_grad():
-                output = st.session_state.model(**tokens)
-            # Use the mean of the last hidden state as the sentence embedding
-            embedding = output.last_hidden_state.mean(dim=1)
-            return embedding.cpu().numpy()
         case 'text-embedding-ada-002':
             text = text.replace("\n", " ")
             embedding = client.embeddings.create(input=[text], model=st.session_state.embedding_model_name)
-            # embedding = openai.Embedding.create(input = [text], engine=st.session_state.embedding_model_name)
             st.session_state.embedding_token_count += embedding.usage.total_tokens
             return embedding.data[0].embedding
         case 'text-embedding-3-small':
@@ -107,18 +47,13 @@ def get_embedding(text):
             st.session_state.embedding_token_count += embedding.usage.total_tokens
             return embedding.data[0].embedding
 
-def add_to_database(cursor, filename, page_number, text_content):
-    # Generate embeddings using OpenAI API
-    # Note: You'll need to implement this part based on OpenAI's API documentation
-    embedding = get_embedding(text_content)
-    # Convert it to bytes for storage as a blob.
-    embedding_blob = np.array(embedding, dtype='float32').tobytes()
-    # Insert into SQLite database
-    insert_query = """INSERT INTO library (file_name, page_number, text_content, embedding)
-                    VALUES (?, ?, ?, ?);"""
-    cursor.execute(insert_query, (filename, page_number, zlib.compress(text_content.encode('utf-8')), embedding_blob))
+def check_disk_space(path, required_space_mb=100):
+    """Check if there's enough disk space available."""
+    total, used, free = shutil.disk_usage(path)
+    free_mb = free // (2**20)
+    return free_mb > required_space_mb
 
-def add_to_database_batch(cursor, filename, pages):
+def add_to_database_batch(collection, filename, pages, max_retries=3, retry_delay=1):
     # Prepare batch of texts for embedding
     texts = list(pages.values())
     page_numbers = list(pages.keys())
@@ -138,15 +73,32 @@ def add_to_database_batch(cursor, filename, pages):
     st.session_state.embedding_token_count += embeddings.usage.total_tokens
 
     # Insert each page and its embedding into the database
-    for page_number, text_content, embedding in zip(page_numbers, texts, embeddings.data):
-        embedding_blob = np.array(embedding.embedding, dtype='float32').tobytes()
-        insert_query = """INSERT INTO library (file_name, page_number, text_content, embedding)
-                        VALUES (?, ?, ?, ?);"""
-        cursor.execute(insert_query, (filename, page_number, zlib.compress(text_content.encode('utf-8')), embedding_blob))
+    ids = [f"{filename}_{page_number}" for page_number in page_numbers]
+    metadatas = [{"filename": filename, "page_number": page_number} for page_number in page_numbers]
+    embeddings_list = [embedding.embedding for embedding in embeddings.data]
 
-    # st.write(f'Added {len(pages)} pages from {filename}.')
+    for attempt in range(max_retries):
+        try:
+            if not check_disk_space("./chroma_db"):
+                st.error("Not enough disk space available. Please free up some space and try again.")
+                return
 
-def process_pdf(pdf_path, cursor, conn):
+            collection.add(
+                ids=ids,
+                embeddings=embeddings_list,
+                metadatas=metadatas,
+                documents=texts
+            )
+            break
+        except InternalError as e:
+            if attempt < max_retries - 1:
+                st.warning(f"Database error occurred. Retrying in {retry_delay} seconds... (Attempt {attempt + 1}/{max_retries})")
+                time.sleep(retry_delay)
+            else:
+                st.error(f"Failed to add data to the database after {max_retries} attempts. Error: {e}")
+                raise
+
+def process_pdf(pdf_path, collection):
     filename = os.path.basename(pdf_path)
     try:
         pdf = fitz.open(pdf_path)
@@ -155,85 +107,86 @@ def process_pdf(pdf_path, cursor, conn):
         return
 
     # Collect all the pages in the pdf and extract text
-    pages ={} # Dictionary to store text content of each page
+    pages = {}  # Dictionary to store text content of each page
     for page_number in range(len(pdf)):
         page = pdf.load_page(page_number)
         text_content = page.get_text() 
         if len(text_content) > 0:
             pages[page_number] = text_content
-        # else:
-        #     st.write(f'Skipping {filename} page {page_number} has no text.')
 
     # Check if this PDF is already in the database
-    check_query = """SELECT COUNT(*) FROM library WHERE file_name = ?;"""
-    cursor.execute(check_query, (filename,))
-    count = cursor.fetchone()[0]
-    if count == len(pages):
-        st.write(f'Skipping {filename}, already in database.')
-        return
+    try:
+        existing_pages = collection.get(
+            where={"filename": filename},
+            include=["metadatas"]
+        )
+        if len(existing_pages['metadatas']) == len(pages):
+            st.write(f'Skipping {filename}, already in database.')
+            return
+    except InternalError as e:
+        st.warning(f"Error checking existing pages for {filename}. Error: {e}")
+        # Continue with adding the PDF, as we couldn't verify if it's already in the database
 
     st.write(f'Adding {filename}.')
 
-    add_to_database_batch(cursor, filename, pages)    
+    add_to_database_batch(collection, filename, pages)    
 
     st.write(f'Tokens={st.session_state.embedding_token_count}')
+    st.success(f"Successfully added {filename} to the database.")
 
-    # conn.commit()
-    # Simple retry mechanism with three attempts
-    max_retries = 3
-    for attempt in range(max_retries):
-        try:
-            conn.commit()
-            st.success(f"Successfully added {filename} to the database.")
-            return  # Exit the function if commit is successful
-        except sqlite3.OperationalError as e:
-            if attempt < max_retries - 1:  # If it's not the last attempt
-                st.warning(f"Commit failed for {filename}. Retrying in 1 second... (Attempt {attempt + 1}/{max_retries})")
-                time.sleep(1)  # Wait for 1 second before retrying
-            else:
-                st.error(f"Failed to commit changes for {filename} after {max_retries} attempts. Error: {e}")
-                raise  # Re-raise the exception if all retries failed
-
-    # This line will only be reached if all retries fail
-    st.error(f"Failed to add {filename} to the database after {max_retries} attempts.")
-
-def populate_database(db_path):
-    conn = sqlite3.connect(db_path)
-    cursor = conn.cursor()
+def populate_database(collection):
     for filename in os.listdir(st.session_state.pdf_directory):
         if filename.endswith('.pdf'):
             pdf_path = os.path.join(st.session_state.pdf_directory, filename)
-            process_pdf(pdf_path, cursor, conn)
-    conn.commit()
-    conn.close()
+            process_pdf(pdf_path, collection)
 
-def get_context(question):
-    # Generate the embedding for the question using OpenAI API (placeholder)
+def get_context(question, collection):
+    # Generate the embedding for the question using OpenAI API
     question_embedding = get_embedding(question)
-    question_embedding = np.array(question_embedding).reshape(1, -1)  # Reshape for cosine_similarity
 
-    # Connect to SQLite database
-    conn = sqlite3.connect(db_path)
-    cursor = conn.cursor()
+    try:
+        # Query the collection for similar contexts
+        results = collection.query(
+            query_embeddings=[question_embedding],
+            n_results=5,
+            include=['metadatas', 'documents', 'distances']
+        )
 
-    # Fetch all embeddings from the database
-    cursor.execute("SELECT file_name, page_number, text_content, embedding FROM library")
-    rows = cursor.fetchall()
+        # # Print debug information
+        # st.write("Debug information:")
+        # st.write(f"Results structure: {results.keys()}")
+        # for key, value in results.items():
+        #     st.write(f"{key}: {type(value)}, Length: {len(value) if value is not None else 'None'}")
 
-    # Calculate cosine similarity
-    db_embeddings = [np.frombuffer(row[3], dtype='float32') for row in rows]
-    db_embeddings = np.vstack(db_embeddings)
-    similarities = cosine_similarity(question_embedding, db_embeddings)
+        # Check if the results contain the expected keys and are not empty
+        if not all(key in results and results[key] for key in ['ids', 'metadatas', 'documents', 'distances']):
+            st.warning("Some expected data is missing from the query results.")
+            return []
 
-    # Get the indices of the three most similar embeddings
-    top_indices = np.argsort(similarities[0])[-3:][::-1]
+        # Assuming the results are sorted by similarity (lowest distance first)
+        closest_contexts = []
+        for i in range(len(results['ids'][0])):
+            metadata = results['metadatas'][0][i]
+            document = results['documents'][0][i]
+            distance = results['distances'][0][i]
+            closest_contexts.append((
+                metadata['filename'],
+                metadata['page_number'],
+                distance,
+                document
+            ))
 
-    # Fetch the corresponding file name, page number and text.
-    closest_contexts = [(rows[i][0], rows[i][1], zlib.decompress(rows[i][2])) for i in top_indices]
+        # st.write(f"Number of results: {len(closest_contexts)}")
+        # st.write(f"Distances: {results['distances']}")
 
-    conn.close()
+        return closest_contexts
 
-    return closest_contexts
+    except Exception as e:
+        st.error(f"Error retrieving context: {str(e)}")
+        st.write("Debug information:")
+        st.write(f"Exception type: {type(e).__name__}")
+        st.write(f"Exception args: {e.args}")
+        return []  # Return an empty list if there's an error
 
 # Streamlit App
 st.title("Library GPT")
@@ -242,8 +195,6 @@ def query_gpt(system_message, context, question, model='gpt-4.1-nano'):
     # Combine system message and user question
     conversation = [
         {"role": "system", "content": system_message},
-        # {"role": "system", "content": context},
-        # {"role": "user", "content": question}
     ]
     for c in context:
         conversation.append({"role":"system", "content": f'Consider the following text: {c[2]}'})
@@ -267,20 +218,18 @@ st.session_state.pdf_directory = st.sidebar.text_input("PDF Directory:", value=s
 st.sidebar.header("System Information")
 system_message = st.sidebar.text_input("Enter information for the system message:", "Please give a scientific answer.")
 
+if 'chroma_client' not in st.session_state or 'collection' not in st.session_state:
+    st.session_state.chroma_client, st.session_state.collection = create_database()
+
 if st.sidebar.button(label="Populate database"):
-    if not os.path.exists(db_path):
-        create_database()
-        st.write(f'New database created in {db_path}.')
     st.spinner("Populating database...")
-    populate_database(db_path)
+    populate_database(st.session_state.collection)
     st.write('Done')
 
-# st.session_state.embedding_model_name = 'text-embedding-ada-002'
 st.session_state.embedding_model_name = 'text-embedding-3-small'
 st.sidebar.write(f'Embedding model: {st.session_state.embedding_model_name}.')
-# embedding_algorithm = st.sidebar.selectbox('Choose an embedding algorithm:', ('squeezebert-uncased', 'bert-base-uncased', 'text-embedding-ada-002'))
-# if 'bert' in embedding_algorithm.lower():
 st.sidebar.write(f'Total tokens embedded: {st.session_state.embedding_token_count}')
+st.write(f"Number of documents in collection: {st.session_state.collection.count()}")
 
 model = st.sidebar.selectbox('Choose a model:', ('gpt-4.1-nano', 'gpt-4.1-mini'))
 
@@ -291,7 +240,7 @@ st.header(f"Welcome, how can I assist you today?")
 user_question = st.text_area("Your Question:")
 if user_question:
     # Search the pdf library to get three pages of context for GPT to use to answer the question.
-    context = get_context(user_question)
+    context = get_context(user_question, st.session_state.collection)
 
     # Go to ChatGPT now.
     answer, usage = query_gpt(system_message=system_message, context=context, question=user_question, model=model)
@@ -302,8 +251,7 @@ if user_question:
     # Display context for the user (they can look a the papers).
     st.write(f'The following papers are used as context on this search:')
     for c in context:
-        # st.write(f'{c[0]}, page {c[1]}')
-        pdf_link = f'<a href="file://{os.path.abspath(os.path.join("PDFs",c[0]))}" target="_blank">{c[0]}, page {c[1]}</a>'
+        pdf_link = f'<a href="file://{os.path.abspath(os.path.join("PDFs",c[0]))}" target="_blank">{c[0]}, page {c[1]}, distance {c[2]}</a>'
         st.markdown(pdf_link, unsafe_allow_html=True)
 
     st.write('Token usage information:')
