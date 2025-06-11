@@ -201,8 +201,8 @@ def query_gpt(system_message, context, question, model='gpt-4.1-nano'):
     conversation = [
         {"role": "system", "content": system_message},
     ]
-    for c in context:
-        conversation.append({"role":"system", "content": f'Consider the following text: {c["content"]}'})
+    for i, c in enumerate(context):
+        conversation.append({"role":"system", "content": f'Consider the following text (context attachment {i}): {c["content"]}'})
     conversation.append({"role": "user", "content": question})
 
     # Make API call
@@ -230,7 +230,7 @@ if st.sidebar.button(label="Populate database"):
 st.sidebar.write(f'Total tokens embedded: {st.session_state.embedding_token_count}')
 
 st.sidebar.header("System Information")
-system_message = st.sidebar.text_input("Enter information for the system message:", "Please give a scientific answer and cite references.")
+system_message = st.sidebar.text_input("Enter information for the system message:", "Please give a scientific answer and cite which context attachment contains the information.")
 
 st.sidebar.header("Query Settings")
 n_results = st.sidebar.slider("Number of context results", min_value=1, max_value=50, value=5, step=1)
