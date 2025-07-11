@@ -2,16 +2,20 @@ import streamlit as st
 import numpy as np
 from sklearn.metrics.pairwise import cosine_similarity
 import os
+import io
 import time
 import fitz  # PyMuPDF
 from openai import OpenAI, OpenAIError
 import chromadb
 from chromadb.config import Settings
+from chromadb.errors import InternalError
+import sqlite3
 import zlib
 import shutil
-from chromadb.errors import InternalError
 import hashlib
 from dotenv import load_dotenv
+import json
+
 #Load the .env file which has the OpenAI API key
 load_dotenv()
 
@@ -32,8 +36,12 @@ def create_database():
     # Create a new collection for our library
     if 'chroma_collection' not in st.session_state:
         st.session_state.chroma_collection = st.session_state.chroma_client.get_or_create_collection(name="library")
-    
+
+    if 'chromasql_conn' not in st.session_state:
+        st.session_state.chromasql_conn = sqlite3.connect(os.path.join("chroma_db", "chroma.sqlite3"))
+        st.session_state.chromasql_cursor = st.session_state.chromasql_conn.cursor()
     return
+
 def get_embedding(text):
     if len(text) == 0:
         return None
@@ -106,28 +114,55 @@ def add_to_database_batch(collection, filename, pages, pdf_hash, max_retries=3, 
                 st.error(f"Failed to add data to the database after {max_retries} attempts. Error: {e}")
                 raise
 
+def load_processed_hashes():
+    """Load the set of already processed PDF hashes."""
+    try:
+        with open("processed_hashes.json", "r") as f:
+            return set(json.load(f))
+    except FileNotFoundError:
+        return set()
+
+def save_processed_hashes(hashes):
+    """Save the set of processed PDF hashes."""
+    with open("processed_hashes.json", "w") as f:
+        json.dump(list(hashes), f)
+
 def process_pdf(pdf_path, collection):
     filename = os.path.basename(pdf_path)
     
+    # Load processed hashes cache if not already loaded
+    if 'processed_hashes' not in st.session_state:
+        st.session_state.processed_hashes = load_processed_hashes()
+    
     # Calculate hash of the PDF
     with open(pdf_path, "rb") as f:
-        pdf_hash = hashlib.sha256(f.read()).hexdigest()
+        pdf_content = f.read()
+        pdf_hash = hashlib.sha256(pdf_content).hexdigest()
 
-    # Check if this PDF is already in the database
+    # Fast check: is it in our local cache?
+    if pdf_hash in st.session_state.processed_hashes:
+        st.write(f'Skipping {filename}, already in database (cached).')
+        return
+
+    # Slow fallback: check the actual database
     try:
         existing_docs = collection.get(
             where={"pdf_hash": pdf_hash},
-            include=["metadatas"]
+            include=["metadatas"],
+            limit=1
         )
         if existing_docs['metadatas']:
-            st.write(f'Skipping {filename}, already in database.')
+            st.write(f'Skipping {filename}, already in database (found in DB).')
+            # Add to cache so we don't need to check DB again
+            st.session_state.processed_hashes.add(pdf_hash)
+            save_processed_hashes(st.session_state.processed_hashes)
             return
     except InternalError as e:
         st.warning(f"Error checking existing pages for {filename}. Error: {e}")
         # Continue with adding the PDF, as we couldn't verify if it's already in the database
 
     try:
-        pdf = fitz.open(pdf_path)
+        pdf = fitz.open(stream=pdf_content, filetype="pdf")
     except Exception as e:
         st.error(f'Failed to open file {pdf_path}. Error: {e}')
         return
@@ -143,6 +178,10 @@ def process_pdf(pdf_path, collection):
     st.write(f'Adding {filename}.')
 
     add_to_database_batch(collection, filename, pages, pdf_hash)    
+
+    # After successful processing, add hash to cache and save
+    st.session_state.processed_hashes.add(pdf_hash)
+    save_processed_hashes(st.session_state.processed_hashes)
 
     st.write(f'Tokens={st.session_state.embedding_token_count}')
     st.success(f"Successfully added {filename} to the database.")
