@@ -144,22 +144,23 @@ def process_pdf(pdf_path, collection):
         st.write(f'Skipping {filename}, already in database (cached).')
         return
 
-    # Slow fallback: check the actual database
-    try:
-        existing_docs = collection.get(
-            where={"pdf_hash": pdf_hash},
-            include=["metadatas"],
-            limit=1
-        )
-        if existing_docs['metadatas']:
-            st.write(f'Skipping {filename}, already in database (found in DB).')
-            # Add to cache so we don't need to check DB again
-            st.session_state.processed_hashes.add(pdf_hash)
-            save_processed_hashes(st.session_state.processed_hashes)
-            return
-    except InternalError as e:
-        st.warning(f"Error checking existing pages for {filename}. Error: {e}")
-        # Continue with adding the PDF, as we couldn't verify if it's already in the database
+    # # Slow fallback: check the actual database
+    # # This is only needed when you've already embedded and are just implementing the offline hash.
+    # try:
+    #     existing_docs = collection.get(
+    #         where={"pdf_hash": pdf_hash},
+    #         include=["metadatas"],
+    #         limit=1
+    #     )
+    #     if existing_docs['metadatas']:
+    #         st.write(f'Skipping {filename}, already in database (found in DB).')
+    #         # Add to cache so we don't need to check DB again
+    #         st.session_state.processed_hashes.add(pdf_hash)
+    #         save_processed_hashes(st.session_state.processed_hashes)
+    #         return
+    # except InternalError as e:
+    #     st.warning(f"Error checking existing pages for {filename}. Error: {e}")
+    #     # Continue with adding the PDF, as we couldn't verify if it's already in the database
 
     try:
         pdf = fitz.open(stream=pdf_content, filetype="pdf")
