@@ -15,11 +15,33 @@ import shutil
 import hashlib
 from dotenv import load_dotenv
 import json
+import threading
+import http.server
+import functools
 
 #Load the .env file which has the OpenAI API key
 load_dotenv()
 
 client = OpenAI()
+
+PDF_SERVER_PORT = 8765
+
+def start_pdf_server(directory, port):
+    """Start a local HTTP server to serve PDFs from the given directory."""
+    handler = functools.partial(http.server.SimpleHTTPRequestHandler, directory=directory)
+    server = http.server.HTTPServer(("localhost", port), handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    return server
+
+def ensure_pdf_server():
+    """Ensure the PDF server is running for the current pdf_directory."""
+    directory = st.session_state.pdf_directory
+    if st.session_state.get('pdf_server_directory') != directory:
+        if 'pdf_server' in st.session_state:
+            st.session_state.pdf_server.shutdown()
+        st.session_state.pdf_server = start_pdf_server(directory, PDF_SERVER_PORT)
+        st.session_state.pdf_server_directory = directory
 
 # Define the paths for the database and pdfs.
 if 'pdf_directory' not in st.session_state:
@@ -260,6 +282,7 @@ def query_gpt(system_message, context, question, model='gpt-4.1-nano'):
 st.sidebar.header("Database Configuration")
 st.sidebar.write(f"ChromaDB version: {chromadb.__version__}")
 st.session_state.pdf_directory = st.sidebar.text_input("PDF Directory:", value=st.session_state.pdf_directory)
+ensure_pdf_server()
 if 'chroma_client' not in st.session_state or 'chroma_collection' not in st.session_state:
     create_database()
 st.sidebar.write(f"Number of documents in collection: {st.session_state.chroma_collection.count()}")
@@ -301,7 +324,7 @@ if user_question:
     # Display context for the user (they can look a the papers).
     st.write(f'The following papers are used as context on this search:')
     for c in context:
-        pdf_link = f'<a href="file://{os.path.abspath(os.path.join(st.session_state.pdf_directory, c["filename"]))}" target="_blank">{c["filename"]}, page {c["page_number"]}, distance {c["distance"]:.4f}</a>'
+        pdf_link = f'<a href="http://localhost:{PDF_SERVER_PORT}/{c["filename"]}#page={c["page_number"] + 1}" target="_blank">{c["filename"]}, page {c["page_number"] + 1}, distance {c["distance"]:.4f}</a>'
         st.markdown(pdf_link, unsafe_allow_html=True)
 
     st.write('Token usage information:')
