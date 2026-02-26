@@ -9,6 +9,7 @@
             "type": "python",
             "request": "launch",
             "program": "~/anaconda3/envs/libgpt312/bin/streamlit",
+            // "program": "~/anaconda3/envs/streamlit311/bin/streamlit",
             "args":["run", "LibraryGPT.py"],
             "console": "integratedTerminal",
             "justMyCode": true

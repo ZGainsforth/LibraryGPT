@@ -161,3 +161,13 @@ cython_debug/
 
 *.pdf
 PDFs/*
+PDFs*/*
+
+# Generated data
+chroma_db
+chroma_db/*
+*.db
+processed_hashes.json
+.vscode
+Load LibraryGPT.lnk
+*.swp
